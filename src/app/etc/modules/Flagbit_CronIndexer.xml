@@ -1,0 +1,10 @@
+<?xml version="1.0"?>
+
+<config>
+    <modules>
+        <Flagbit_CronIndexer>
+            <active>true</active>
+            <codePool>community</codePool>
+        </Flagbit_CronIndexer>
+    </modules>
+</config>
