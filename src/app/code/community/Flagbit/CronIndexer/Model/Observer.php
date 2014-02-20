@@ -9,18 +9,44 @@
 
 class Flagbit_CronIndexer_Model_Observer {
 
+    protected $_factory = null;
+    protected $_lastSchedule = null;
 
+    /**
+     * Get Indexer instance
+     *
+     * @return Mage_Index_Model_Indexer
+     */
+    protected function _getIndexer()
+    {
+        if(Mage::helper('flagbit_cronindexer')->isNewIndexerEnabled()){
+            if($this->_factory === null){
+                $this->_factory = new Mage_Core_Model_Factory();
+            }
+            return $this->_factory->getSingleton($this->_factory->getIndexClassAlias());
+        }
+        return Mage::getSingleton('index/indexer');
+    }
+
+    /**
+     * @param $schedule
+     */
     public function process($schedule)
     {
-        /* @var $indexer Mage_Index_Model_Indexer */
-        $indexer    = Mage::getSingleton('index/indexer');
         $processIds = explode(',', $schedule->getMessages());
 
+        $processIdsExecuted = array();
         foreach ($processIds as $processId) {
             /* @var $process Mage_Index_Model_Process */
-            $process = $indexer->getProcessById($processId);
+            $process = $this->_getIndexer()->getProcessById($processId);
             if ($process) {
-                $process->reindexEverything();
+                try{
+                    $process->reindexEverything();
+                }catch (Exception $e){
+                    Mage::logException($e);
+                }
+                $processIdsExecuted[] = $processId;
+                $schedule->setMessages(implode(',', array_diff ($processIds, $processIdsExecuted)))->save();
             }
         }
     }
@@ -37,9 +63,16 @@ class Flagbit_CronIndexer_Model_Observer {
         /* @var $block Mage_Adminhtml_Block_Widget_Grid */
         $block = $observer->getBlock();
 
-        if ($block instanceof Mage_Index_Block_Adminhtml_Process_Grid
+        if (($block instanceof Mage_Index_Block_Adminhtml_Process_Grid
+            || $block instanceof Enterprise_Index_Block_Adminhtml_Process_Grid)
             && $block->getId() == 'indexer_processes_grid'
         ) {
+
+            // add process ids
+            if(Mage::helper('flagbit_cronindexer')->isNewIndexerEnabled()){
+                $this->_enrichIndexCollection($block->getCollection());
+            }
+
             $block->addColumn(
                 'dynamic',
                 array(
@@ -61,6 +94,45 @@ class Flagbit_CronIndexer_Model_Observer {
     }
 
     /**
+     * enrich collection with process ids and execution times
+     *
+     * @param $collection
+     */
+    protected function _enrichIndexCollection($collection)
+    {
+        foreach($collection as $item){
+            if(is_int($item->getProcessId())){
+                continue;
+            }
+            $indexer = Mage::getSingleton('index/indexer')->getProcessByCode($item->getIndexerCode());
+            #Zend_Debug::dump($indexer->getData());
+            if($indexer->getProcessId()){
+                $item->setProcessId($indexer->getProcessId());
+                $item->setEndedAt($this->_getLastSchedule()->getFinishedAt());
+            }
+        }
+    }
+
+
+    /**
+     * get the last schedule
+     *
+     * @return Mage_Cron_Model_Schedule
+     */
+    protected function _getLastSchedule()
+    {
+        if($this->_lastSchedule === null){
+            /* @var $collection Mage_Cron_Model_Resource_Schedule_Collection */
+            $collection = Mage::getModel('cron/schedule')->getCollection();
+            $collection->addFieldToFilter('job_code', array('eg' => 'flagbit_cronindexer'))
+                       ->setOrder('scheduled_at', 'DESC')->setPageSize(1);
+
+            $this->_lastSchedule  = $collection->getFirstItem();
+        }
+        return $this->_lastSchedule;
+    }
+
+    /**
      * Decorate Type column values
      *
      * @return string
@@ -68,21 +140,14 @@ class Flagbit_CronIndexer_Model_Observer {
     public function decorateType($value, $row, $column, $isExport)
     {
 
-        /* @var $collection Mage_Cron_Model_Resource_Schedule_Collection */
-        $collection = Mage::getModel('cron/schedule')->getCollection();
-        $collection->addFieldToFilter('job_code', array('eg' => 'flagbit_cronindexer'))
-                   ->setOrder('scheduled_at', 'DESC');
-
-        $schedule = $collection->getFirstItem();
-
         $class = 'grid-severity-notice';
         $value = $column->getGrid()->__('nothing planned');
 
-        if (in_array($row->getId(), explode(',', $schedule->getMessages()))) {
+        if (in_array($row->getId(), explode(',', $this->_getLastSchedule()->getMessages()))) {
 
-            $scheduledAtTimestamp = strtotime($schedule->getScheduledAt());
-            $executedAtTimestamp = strtotime($schedule->getExecutedAt());
-            $finishedAtTimestamp = strtotime($schedule->getFinishedAt());
+            $scheduledAtTimestamp = strtotime($this->_getLastSchedule()->getScheduledAt());
+            $executedAtTimestamp = strtotime($this->_getLastSchedule()->getExecutedAt());
+            $finishedAtTimestamp = strtotime($this->_getLastSchedule()->getFinishedAt());
 
 
             // will be executed in the future
@@ -91,23 +156,23 @@ class Flagbit_CronIndexer_Model_Observer {
                 $value = $column->getGrid()->__('pending (%s minutes)', round(($scheduledAtTimestamp - time())/60, 0));
 
             // will be executed in the future
-            }elseif($scheduledAtTimestamp < time() && !$schedule->getExecutedAt()){
+            }elseif($scheduledAtTimestamp < time() && !$this->_getLastSchedule()->getExecutedAt()){
                 $class = 'grid-severity-major';
                 $value = $column->getGrid()->__('pending (%s minutes)', round(($scheduledAtTimestamp - time())/60, 0));
 
             // is running
             }elseif($scheduledAtTimestamp < time()
-                && $schedule->getExecutedAt() && $executedAtTimestamp < time()
-                && !$schedule->getFinishedAt()){
+                && $this->_getLastSchedule()->getExecutedAt() && $executedAtTimestamp < time()
+                && !$this->_getLastSchedule()->getFinishedAt()){
                 $class = 'grid-severity-minor';
                 $value = $column->getGrid()->__('running (%s minutes)', round((time() - $executedAtTimestamp) /60, 0));
 
             // was executed
             }elseif($scheduledAtTimestamp < time()
-                && $schedule->getExecutedAt() && $executedAtTimestamp < time()
-                && $schedule->getFinishedAt()){
+                && $this->_getLastSchedule()->getExecutedAt() && $executedAtTimestamp < time()
+                && $this->_getLastSchedule()->getFinishedAt()){
                 $class = 'grid-severity-notice';
-                $value = $column->getGrid()->__('finished %s', Mage::helper('core')->formatDate($schedule->getFinishedAt(), Mage_Core_Model_Locale::FORMAT_TYPE_SHORT, true));
+                $value = $column->getGrid()->__('finished %s', Mage::helper('core')->formatDate($this->_getLastSchedule()->getFinishedAt(), Mage_Core_Model_Locale::FORMAT_TYPE_SHORT, true));
             }
        }
 
